@@ -133,3 +133,54 @@ echo -n 'SqlApp-User-2026!' | gcloud secrets create csql-sqlserver-app-user-pass
   --data-file=- \
   --replication-policy=automatic \
   --project=dba
+#################################
+##################################
+
+
+#modules/google-cloud-sql/main.tf.
+
+dynamic "backup_configuration" {
+  for_each = startswith(var.database_version, "SQLSERVER") ? [1] : []
+
+  content {
+    enabled    = var.backup_configuration.enabled
+    start_time = var.backup_configuration.start_time
+
+    backup_retention_settings {
+      retained_backups = var.backup_configuration.retained_backups
+      retention_unit   = var.backup_configuration.retention_unit
+    }
+  }
+}
+
+dynamic "backup_configuration" {
+  for_each = startswith(var.database_version, "MYSQL") ? [1] : []
+
+  content {
+    enabled                        = var.backup_configuration.enabled
+    start_time                     = var.backup_configuration.start_time
+    point_in_time_recovery_enabled = var.backup_configuration.point_in_time_recovery_enabled
+    binary_log_enabled             = true
+
+    backup_retention_settings {
+      retained_backups = var.backup_configuration.retained_backups
+      retention_unit   = var.backup_configuration.retention_unit
+    }
+  }
+}
+
+dynamic "backup_configuration" {
+  for_each = startswith(var.database_version, "POSTGRES") ? [1] : []
+
+  content {
+    enabled                        = var.backup_configuration.enabled
+    start_time                     = var.backup_configuration.start_time
+    point_in_time_recovery_enabled = var.backup_configuration.point_in_time_recovery_enabled
+    transaction_log_retention_days = var.backup_configuration.transaction_log_retention_days
+
+    backup_retention_settings {
+      retained_backups = var.backup_configuration.retained_backups
+      retention_unit   = var.backup_configuration.retention_unit
+    }
+  }
+}
