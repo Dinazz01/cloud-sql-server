@@ -106,3 +106,85 @@ users:
     password_secret: csql-sqlserver-app-user-password
 
 Avoid hardcoded passwords in YAML.
+#############################################################
+
+instance_name = "csql-instance-${substr(var.environment, 0, 1)}-${local.location_short}-${var.platform}-${var.name}"
+
+which generates names like:
+
+csql-instance-d-use4-hhtt-csql-instance3
+Option 1 (Recommended): Make the random suffix optional
+
+Instead of always appending random numbers, make it configurable.
+
+Step 1. Create a random integer
+resource "random_integer" "instance_suffix" {
+  min = 1000
+  max = 9999
+}
+Step 2. Add a variable
+variable "append_random_suffix" {
+  description = "Append a random 4-digit suffix to resource names."
+  type        = bool
+  default     = false
+}
+Step 3. Update the name
+locals {
+  instance_name = var.append_random_suffix ?
+    "csql-instance-${substr(var.environment, 0, 1)}-${local.location_short}-${var.platform}-${var.name}-${random_integer.instance_suffix.result}" :
+    "csql-instance-${substr(var.environment, 0, 1)}-${local.location_short}-${var.platform}-${var.name}"
+}
+
+Now you'll get either:
+
+Without suffix:
+
+csql-instance-d-use4-hhtt-instance3
+
+With suffix:
+
+csql-instance-d-use4-hhtt-instance3-4821
+Option 2: Use random_string
+
+If you prefer alphanumeric values:
+
+resource "random_string" "instance_suffix" {
+  length  = 4
+  special = false
+  upper   = false
+  numeric = true
+}
+
+Then:
+
+locals {
+  instance_name = "csql-instance-${substr(var.environment, 0, 1)}-${local.location_short}-${var.platform}-${var.name}-${random_string.instance_suffix.result}"
+}
+
+Produces:
+
+csql-instance-d-use4-hhtt-instance3-7315
+Option 3 (My recommendation for enterprise environments)
+
+Instead of using random numbers in production, I recommend using them only for ephemeral environments such as feature branches or developer sandboxes.
+
+For example:
+
+locals {
+  use_random_suffix = contains(
+    ["dev", "sandbox", "feature"],
+    lower(var.environment)
+  )
+
+  instance_name = local.use_random_suffix ?
+    "csql-instance-${substr(var.environment, 0, 1)}-${local.location_short}-${var.platform}-${var.name}-${random_integer.instance_suffix.result}" :
+    "csql-instance-${substr(var.environment, 0, 1)}-${local.location_short}-${var.platform}-${var.name}"
+}
+
+This gives you:
+
+Environment	Instance Name
+dev	csql-instance-d-use4-hhtt-instance3-4821
+sandbox	csql-instance-s-use4-hhtt-instance3-7315
+uat	csql-instance-u-use4-hhtt-instance3
+prod	csql-instance-p-use4-hhtt-instance3
