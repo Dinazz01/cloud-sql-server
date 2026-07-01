@@ -1,0 +1,943 @@
+I would split it like this:
+
+modules/
+  cloudsql-mysql/
+    main.tf
+    variables.tf
+    outputs.tf
+
+  cloudsql-postgresql/
+    main.tf
+    variables.tf
+    outputs.tf
+
+  cloudsql-sqlserver/
+    main.tf
+    variables.tf
+    outputs.tf
+
+Then keep a higher-level factory/orchestration layer:
+
+modules/
+  cloudsql-factory/
+    main.tf
+    variables.tf
+Why this is better
+
+Right now, one module has many conditions like:
+
+startswith(var.database_version, "MYSQL")
+startswith(var.database_version, "POSTGRES")
+startswith(var.database_version, "SQLSERVER")
+
+That works, but it becomes harder to maintain because MySQL, PostgreSQL, and SQL Server have different rules for:
+
+backups
+flags
+password requirements
+auditing
+replicas
+charset/collation
+IAM authentication
+SQL Server HA
+PostgreSQL extensions
+Recommended structure
+
+Your factory module decides which child module to call:
+
+module "mysql" {
+  source = "../cloudsql-mysql"
+  for_each = {
+    for k, v in var.instances : k => v
+    if startswith(v.database_version, "MYSQL")
+  }
+
+  name             = each.value.name
+  project_id       = var.project_id
+  database_version = each.value.database_version
+}
+module "postgresql" {
+  source = "../cloudsql-postgresql"
+  for_each = {
+    for k, v in var.instances : k => v
+    if startswith(v.database_version, "POSTGRES")
+  }
+
+  name             = each.value.name
+  project_id       = var.project_id
+  database_version = each.value.database_version
+}
+module "sqlserver" {
+  source = "../cloudsql-sqlserver"
+  for_each = {
+    for k, v in var.instances : k => v
+    if startswith(v.database_version, "SQLSERVER")
+  }
+
+  name             = each.value.name
+  project_id       = var.project_id
+  database_version = each.value.database_version
+}
+Best recommendation
+
+Yes, split them into 3 modules, but do not duplicate everything.
+
+Use shared/common pieces for:
+
+naming
+labels
+networking
+PSC
+maintenance window
+backup base variables
+outputs
+
+Then engine-specific modules handle only engine-specific behavior.
+
+For example:
+
+cloudsql-mysql       → MySQL flags, MySQL users, MySQL replicas
+cloudsql-postgresql  → pgaudit, PostgreSQL flags, IAM auth, extensions
+cloudsql-sqlserver   → root password required, no charset/collation, REGIONAL HA
+
+########################################
+#########################################
+
+
+modules/
+  cloudsql-mysql/
+  cloudsql-postgresql/
+  cloudsql-sqlserver/
+  cloudsql-factory/
+1. modules/cloudsql-mysql/main.tf
+locals {
+  instance_name = var.instance_name
+
+  default_flags = {
+    slow_query_log     = "on"
+    log_output         = "FILE"
+    general_log        = "off"
+    local_infile       = "off"
+    skip_show_database = "on"
+  }
+
+  flags = merge(local.default_flags, var.flags)
+}
+
+resource "google_sql_database_instance" "this" {
+  name             = local.instance_name
+  project          = var.project_id
+  region           = var.region
+  database_version = var.database_version
+
+  deletion_protection = var.deletion_protection
+  root_password       = var.root_password_secret != null ? data.google_secret_manager_secret_version.root_password[0].secret_data : random_password.root_password[0].result
+
+  settings {
+    tier              = var.tier
+    edition           = var.edition
+    availability_type = var.availability_type
+    disk_size         = var.disk_size
+    disk_type         = var.disk_type
+    disk_autoresize   = var.disk_autoresize
+    user_labels       = var.labels
+
+    ip_configuration {
+      ipv4_enabled = var.ipv4_enabled
+      ssl_mode     = var.ssl_mode
+
+      dynamic "psc_config" {
+        for_each = var.psc_config == null ? [] : [var.psc_config]
+        content {
+          psc_enabled               = true
+          allowed_consumer_projects = psc_config.value.allowed_consumer_projects
+        }
+      }
+    }
+
+    backup_configuration {
+      enabled                        = var.backup_config.enabled
+      start_time                     = var.backup_config.start_time
+      binary_log_enabled             = var.backup_config.point_in_time_recovery_enabled
+      point_in_time_recovery_enabled = false
+
+      backup_retention_settings {
+        retained_backups = var.backup_config.retained_backups
+        retention_unit   = var.backup_config.retention_unit
+      }
+    }
+
+    dynamic "database_flags" {
+      for_each = local.flags
+      content {
+        name  = database_flags.key
+        value = database_flags.value
+      }
+    }
+
+    dynamic "maintenance_window" {
+      for_each = var.maintenance_window.enabled ? [var.maintenance_window] : []
+      content {
+        day          = maintenance_window.value.day
+        hour         = maintenance_window.value.hour
+        update_track = maintenance_window.value.update_track
+      }
+    }
+  }
+}
+
+resource "random_password" "root_password" {
+  count   = var.root_password_secret == null ? 1 : 0
+  length  = 16
+  special = true
+  upper   = true
+  lower   = true
+  numeric = true
+}
+
+data "google_secret_manager_secret_version" "root_password" {
+  count   = var.root_password_secret != null ? 1 : 0
+  secret  = var.root_password_secret
+  project = var.project_id
+}
+
+resource "google_sql_database" "databases" {
+  for_each = var.databases
+
+  project  = var.project_id
+  instance = google_sql_database_instance.this.name
+  name     = each.value.name
+  charset  = try(each.value.charset, null)
+  collation = try(each.value.collation, null)
+
+  depends_on = [google_sql_database_instance.this]
+}
+
+data "google_secret_manager_secret_version" "user_passwords" {
+  for_each = {
+    for username, cfg in var.users : username => cfg
+    if try(cfg.password_secret, null) != null
+  }
+
+  project = var.project_id
+  secret  = each.value.password_secret
+}
+
+resource "random_password" "user_passwords" {
+  for_each = {
+    for username, cfg in var.users : username => cfg
+    if try(cfg.password_secret, null) == null
+  }
+
+  length  = 16
+  special = true
+  upper   = true
+  lower   = true
+  numeric = true
+}
+
+resource "google_sql_user" "users" {
+  for_each = var.users
+
+  project  = var.project_id
+  instance = google_sql_database_instance.this.name
+  name     = each.key
+
+  password = try(
+    data.google_secret_manager_secret_version.user_passwords[each.key].secret_data,
+    random_password.user_passwords[each.key].result
+  )
+
+  depends_on = [google_sql_database.databases]
+}
+2. modules/cloudsql-postgresql/main.tf
+locals {
+  instance_name = var.instance_name
+
+  default_flags = {
+    "cloudsql.iam_authentication" = "on"
+    "log_checkpoints"             = "on"
+    "log_connections"             = "on"
+    "log_disconnections"          = "on"
+    "log_min_duration_statement"  = "1000"
+    "log_lock_waits"              = "on"
+    "log_duration"                = "off"
+  }
+
+  flags = merge(local.default_flags, var.flags)
+}
+
+resource "google_sql_database_instance" "this" {
+  name             = local.instance_name
+  project          = var.project_id
+  region           = var.region
+  database_version = var.database_version
+
+  deletion_protection = var.deletion_protection
+
+  settings {
+    tier                        = var.tier
+    edition                     = var.edition
+    availability_type           = var.availability_type
+    disk_size                   = var.disk_size
+    disk_type                   = var.disk_type
+    disk_autoresize             = var.disk_autoresize
+    user_labels                 = var.labels
+    deletion_protection_enabled = var.deletion_protection
+
+    ip_configuration {
+      ipv4_enabled = var.ipv4_enabled
+      ssl_mode     = var.ssl_mode
+
+      dynamic "psc_config" {
+        for_each = var.psc_config == null ? [] : [var.psc_config]
+        content {
+          psc_enabled               = true
+          allowed_consumer_projects = psc_config.value.allowed_consumer_projects
+        }
+      }
+    }
+
+    backup_configuration {
+      enabled                        = var.backup_config.enabled
+      start_time                     = var.backup_config.start_time
+      point_in_time_recovery_enabled = var.backup_config.point_in_time_recovery_enabled
+      transaction_log_retention_days = var.backup_config.transaction_log_retention_days
+
+      backup_retention_settings {
+        retained_backups = var.backup_config.retained_backups
+        retention_unit   = var.backup_config.retention_unit
+      }
+    }
+
+    dynamic "database_flags" {
+      for_each = local.flags
+      content {
+        name  = database_flags.key
+        value = database_flags.value
+      }
+    }
+
+    dynamic "maintenance_window" {
+      for_each = var.maintenance_window.enabled ? [var.maintenance_window] : []
+      content {
+        day          = maintenance_window.value.day
+        hour         = maintenance_window.value.hour
+        update_track = maintenance_window.value.update_track
+      }
+    }
+  }
+}
+
+resource "google_sql_database" "databases" {
+  for_each = var.databases
+
+  project   = var.project_id
+  instance  = google_sql_database_instance.this.name
+  name      = each.value.name
+  charset   = try(each.value.charset, null)
+  collation = try(each.value.collation, null)
+
+  depends_on = [google_sql_database_instance.this]
+}
+
+data "google_secret_manager_secret_version" "user_passwords" {
+  for_each = {
+    for username, cfg in var.users : username => cfg
+    if try(cfg.password_secret, null) != null
+  }
+
+  project = var.project_id
+  secret  = each.value.password_secret
+}
+
+resource "random_password" "user_passwords" {
+  for_each = {
+    for username, cfg in var.users : username => cfg
+    if try(cfg.password_secret, null) == null && try(cfg.type, "BUILT_IN") == "BUILT_IN"
+  }
+
+  length  = 16
+  special = true
+  upper   = true
+  lower   = true
+  numeric = true
+}
+
+resource "google_sql_user" "users" {
+  for_each = var.users
+
+  project  = var.project_id
+  instance = google_sql_database_instance.this.name
+  name     = each.key
+  type     = try(each.value.type, "BUILT_IN")
+
+  password = try(each.value.type, "BUILT_IN") == "BUILT_IN" ? try(
+    data.google_secret_manager_secret_version.user_passwords[each.key].secret_data,
+    random_password.user_passwords[each.key].result
+  ) : null
+
+  depends_on = [google_sql_database.databases]
+}
+3. modules/cloudsql-sqlserver/main.tf
+locals {
+  instance_name = var.instance_name
+
+  default_flags = {
+    "external scripts enabled"        = "off"
+    "cross db ownership chaining"     = "off"
+    "remote access"                   = "off"
+    "3625 (trace flag)"               = "off"
+    "contained database authentication" = "off"
+  }
+
+  flags = merge(local.default_flags, var.flags)
+}
+
+resource "google_sql_database_instance" "this" {
+  name             = local.instance_name
+  project          = var.project_id
+  region           = var.region
+  database_version = var.database_version
+
+  deletion_protection = var.deletion_protection
+
+  root_password = var.root_password_secret != null ? (
+    data.google_secret_manager_secret_version.root_password[0].secret_data
+  ) : random_password.root_password[0].result
+
+  settings {
+    tier              = var.tier
+    edition           = var.edition
+    availability_type = var.availability_type
+    disk_size         = var.disk_size
+    disk_type         = var.disk_type
+    disk_autoresize   = var.disk_autoresize
+    user_labels       = var.labels
+
+    ip_configuration {
+      ipv4_enabled = var.ipv4_enabled
+      ssl_mode     = var.ssl_mode
+
+      dynamic "psc_config" {
+        for_each = var.psc_config == null ? [] : [var.psc_config]
+        content {
+          psc_enabled               = true
+          allowed_consumer_projects = psc_config.value.allowed_consumer_projects
+        }
+      }
+    }
+
+    backup_configuration {
+      enabled    = var.backup_config.enabled
+      start_time = var.backup_config.start_time
+
+      backup_retention_settings {
+        retained_backups = var.backup_config.retained_backups
+        retention_unit   = var.backup_config.retention_unit
+      }
+    }
+
+    dynamic "database_flags" {
+      for_each = local.flags
+      content {
+        name  = database_flags.key
+        value = database_flags.value
+      }
+    }
+
+    dynamic "maintenance_window" {
+      for_each = var.maintenance_window.enabled ? [var.maintenance_window] : []
+      content {
+        day          = maintenance_window.value.day
+        hour         = maintenance_window.value.hour
+        update_track = maintenance_window.value.update_track
+      }
+    }
+  }
+}
+
+data "google_secret_manager_secret_version" "root_password" {
+  count   = var.root_password_secret != null ? 1 : 0
+  project = var.project_id
+  secret  = var.root_password_secret
+}
+
+resource "random_password" "root_password" {
+  count   = var.root_password_secret == null ? 1 : 0
+  length  = 16
+  special = true
+  upper   = true
+  lower   = true
+  numeric = true
+}
+
+resource "google_sql_database" "databases" {
+  for_each = var.databases
+
+  project  = var.project_id
+  instance = google_sql_database_instance.this.name
+  name     = each.value.name
+
+  depends_on = [google_sql_database_instance.this]
+}
+
+data "google_secret_manager_secret_version" "user_passwords" {
+  for_each = {
+    for username, cfg in var.users : username => cfg
+    if try(cfg.password_secret, null) != null
+  }
+
+  project = var.project_id
+  secret  = each.value.password_secret
+}
+
+resource "random_password" "user_passwords" {
+  for_each = {
+    for username, cfg in var.users : username => cfg
+    if try(cfg.password_secret, null) == null
+  }
+
+  length  = 16
+  special = true
+  upper   = true
+  lower   = true
+  numeric = true
+}
+
+resource "google_sql_user" "users" {
+  for_each = var.users
+
+  project  = var.project_id
+  instance = google_sql_database_instance.this.name
+  name     = each.key
+
+  password = try(
+    data.google_secret_manager_secret_version.user_passwords[each.key].secret_data,
+    random_password.user_passwords[each.key].result
+  )
+
+  depends_on = [google_sql_database.databases]
+}
+4. Shared variables.tf for each engine module
+
+Put this same file in each of the 3 modules:
+
+variable "project_id" {
+  type = string
+}
+
+variable "instance_name" {
+  type = string
+}
+
+variable "region" {
+  type = string
+}
+
+variable "database_version" {
+  type = string
+}
+
+variable "tier" {
+  type = string
+}
+
+variable "edition" {
+  type    = string
+  default = "ENTERPRISE_PLUS"
+}
+
+variable "availability_type" {
+  type    = string
+  default = "ZONAL"
+
+  validation {
+    condition     = contains(["ZONAL", "REGIONAL"], var.availability_type)
+    error_message = "availability_type must be ZONAL or REGIONAL."
+  }
+}
+
+variable "disk_size" {
+  type    = number
+  default = 20
+}
+
+variable "disk_type" {
+  type    = string
+  default = "PD_SSD"
+}
+
+variable "disk_autoresize" {
+  type    = bool
+  default = true
+}
+
+variable "deletion_protection" {
+  type    = bool
+  default = false
+}
+
+variable "ipv4_enabled" {
+  type    = bool
+  default = false
+}
+
+variable "ssl_mode" {
+  type    = string
+  default = "ENCRYPTED_ONLY"
+}
+
+variable "root_password_secret" {
+  type    = string
+  default = null
+}
+
+variable "psc_config" {
+  type = object({
+    allowed_consumer_projects = list(string)
+  })
+
+  default = null
+}
+
+variable "backup_config" {
+  type = object({
+    enabled                        = bool
+    start_time                     = string
+    retained_backups               = number
+    retention_unit                 = string
+    point_in_time_recovery_enabled = optional(bool, false)
+    transaction_log_retention_days = optional(number, null)
+  })
+
+  default = {
+    enabled                        = true
+    start_time                     = "03:00"
+    retained_backups               = 14
+    retention_unit                 = "COUNT"
+    point_in_time_recovery_enabled = false
+    transaction_log_retention_days = null
+  }
+}
+
+variable "maintenance_window" {
+  type = object({
+    enabled      = bool
+    day          = number
+    hour         = number
+    update_track = string
+  })
+
+  default = {
+    enabled      = false
+    day          = 7
+    hour         = 3
+    update_track = "stable"
+  }
+}
+
+variable "databases" {
+  type = map(object({
+    name      = string
+    charset   = optional(string)
+    collation = optional(string)
+  }))
+
+  default = {}
+}
+
+variable "users" {
+  type = map(object({
+    password_secret = optional(string)
+    type            = optional(string)
+  }))
+
+  default = {}
+}
+
+variable "flags" {
+  type    = map(string)
+  default = {}
+}
+
+variable "labels" {
+  type    = map(string)
+  default = {}
+}
+5. Shared outputs.tf for each engine module
+output "instance_name" {
+  value = google_sql_database_instance.this.name
+}
+
+output "connection_name" {
+  value = google_sql_database_instance.this.connection_name
+}
+
+output "self_link" {
+  value = google_sql_database_instance.this.self_link
+}
+
+output "private_ip_address" {
+  value = try(google_sql_database_instance.this.private_ip_address, null)
+}
+
+output "public_ip_address" {
+  value = try(google_sql_database_instance.this.public_ip_address, null)
+}
+6. modules/cloudsql-factory/main.tf
+locals {
+  location_parts  = regex("^us-([a-z]+)([0-9]+)-([a-z])$", var.region)
+  location_short  = "us${local.location_parts[1]}${local.location_parts[2]}${local.location_parts[3]}"
+
+  base_name = "csql-${substr(var.environment, 0, 1)}-${local.location_short}-${var.platform}"
+
+  mysql_instances = {
+    for key, instance in var.instances : key => instance
+    if startswith(instance.database_version, "MYSQL")
+  }
+
+  postgres_instances = {
+    for key, instance in var.instances : key => instance
+    if startswith(instance.database_version, "POSTGRES")
+  }
+
+  sqlserver_instances = {
+    for key, instance in var.instances : key => instance
+    if startswith(instance.database_version, "SQLSERVER")
+  }
+}
+
+module "mysql" {
+  source = "../cloudsql-mysql"
+
+  for_each = local.mysql_instances
+
+  project_id          = var.project_id
+  region              = var.region
+  instance_name       = "${local.base_name}-${each.key}"
+  database_version    = each.value.database_version
+  tier                = each.value.tier
+  edition             = try(each.value.edition, "ENTERPRISE_PLUS")
+  availability_type   = try(each.value.availability_type, "ZONAL")
+  disk_size           = try(each.value.disk_size, 20)
+  disk_type           = try(each.value.disk_type, "PD_SSD")
+  disk_autoresize     = try(each.value.disk_autoresize, true)
+  deletion_protection = try(each.value.deletion_protection, false)
+  ipv4_enabled        = try(each.value.ipv4_enabled, false)
+  ssl_mode            = try(each.value.ssl_mode, "ENCRYPTED_ONLY")
+  root_password_secret = try(each.value.root_password_secret, null)
+  psc_config          = try(each.value.psc_config, null)
+  backup_config       = try(each.value.backup_config, null) == null ? null : each.value.backup_config
+  maintenance_window  = try(each.value.maintenance_window, null) == null ? null : each.value.maintenance_window
+  databases           = try(each.value.databases, {})
+  users               = try(each.value.users, {})
+  flags               = try(each.value.flags, {})
+  labels              = try(each.value.labels, {})
+}
+
+module "postgresql" {
+  source = "../cloudsql-postgresql"
+
+  for_each = local.postgres_instances
+
+  project_id          = var.project_id
+  region              = var.region
+  instance_name       = "${local.base_name}-${each.key}"
+  database_version    = each.value.database_version
+  tier                = each.value.tier
+  edition             = try(each.value.edition, "ENTERPRISE_PLUS")
+  availability_type   = try(each.value.availability_type, "ZONAL")
+  disk_size           = try(each.value.disk_size, 20)
+  disk_type           = try(each.value.disk_type, "PD_SSD")
+  disk_autoresize     = try(each.value.disk_autoresize, true)
+  deletion_protection = try(each.value.deletion_protection, false)
+  ipv4_enabled        = try(each.value.ipv4_enabled, false)
+  ssl_mode            = try(each.value.ssl_mode, "ENCRYPTED_ONLY")
+  psc_config          = try(each.value.psc_config, null)
+  backup_config       = try(each.value.backup_config, null) == null ? null : each.value.backup_config
+  maintenance_window  = try(each.value.maintenance_window, null) == null ? null : each.value.maintenance_window
+  databases           = try(each.value.databases, {})
+  users               = try(each.value.users, {})
+  flags               = try(each.value.flags, {})
+  labels              = try(each.value.labels, {})
+}
+
+module "sqlserver" {
+  source = "../cloudsql-sqlserver"
+
+  for_each = local.sqlserver_instances
+
+  project_id          = var.project_id
+  region              = var.region
+  instance_name       = "${local.base_name}-${each.key}"
+  database_version    = each.value.database_version
+  tier                = each.value.tier
+  edition             = try(each.value.edition, "ENTERPRISE_PLUS")
+  availability_type   = try(each.value.availability_type, "REGIONAL")
+  disk_size           = try(each.value.disk_size, 20)
+  disk_type           = try(each.value.disk_type, "PD_SSD")
+  disk_autoresize     = try(each.value.disk_autoresize, true)
+  deletion_protection = try(each.value.deletion_protection, false)
+  ipv4_enabled        = try(each.value.ipv4_enabled, false)
+  ssl_mode            = try(each.value.ssl_mode, "ENCRYPTED_ONLY")
+  root_password_secret = try(each.value.root_password_secret, null)
+  psc_config          = try(each.value.psc_config, null)
+  backup_config       = try(each.value.backup_config, null) == null ? null : each.value.backup_config
+  maintenance_window  = try(each.value.maintenance_window, null) == null ? null : each.value.maintenance_window
+  databases           = try(each.value.databases, {})
+  users               = try(each.value.users, {})
+  flags               = try(each.value.flags, {})
+  labels              = try(each.value.labels, {})
+}
+
+One issue in the factory: if you pass null into an object variable with defaults, Terraform may complain. So either avoid overriding with null, or make all values required in the factory variable. Simpler pattern: define defaults in YAML.
+
+7. modules/cloudsql-factory/variables.tf
+variable "project_id" {
+  type = string
+}
+
+variable "region" {
+  type = string
+}
+
+variable "environment" {
+  type = string
+}
+
+variable "platform" {
+  type = string
+}
+
+variable "instances" {
+  type = map(any)
+}
+8. Example root module
+module "cloudsql_factory" {
+  source = "../../modules/cloudsql-factory"
+
+  project_id  = var.project_id
+  region      = var.region
+  environment = var.environment
+  platform    = var.platform
+
+  instances = var.instances
+}
+9. Example terraform.tfvars
+project_id  = "dba"
+region      = "us-east4"
+environment = "development"
+platform    = "hhtt"
+
+instances = {
+  mysql01 = {
+    database_version  = "MYSQL_8_4"
+    tier              = "db-custom-4-16384"
+    availability_type = "REGIONAL"
+
+    root_password_secret = "csql-mysql-root-password"
+
+    psc_config = {
+      allowed_consumer_projects = ["154211679085"]
+    }
+
+    databases = {
+      appdb = {
+        name      = "appdb"
+        charset   = "utf8mb4"
+        collation = "utf8mb4_unicode_ci"
+      }
+    }
+
+    users = {
+      app_user = {
+        password_secret = "csql-mysql-app-user-password"
+      }
+    }
+
+    flags = {
+      general_log = "off"
+    }
+
+    labels = {
+      environment = "development"
+      team        = "dba"
+    }
+  }
+
+  postgres01 = {
+    database_version  = "POSTGRES_18"
+    tier              = "db-custom-4-16384"
+    availability_type = "REGIONAL"
+
+    psc_config = {
+      allowed_consumer_projects = ["154211679085"]
+    }
+
+    backup_config = {
+      enabled                        = true
+      start_time                     = "03:00"
+      retained_backups               = 14
+      retention_unit                 = "COUNT"
+      point_in_time_recovery_enabled = true
+      transaction_log_retention_days = 7
+    }
+
+    databases = {
+      appdb = {
+        name      = "appdb"
+        charset   = "UTF8"
+        collation = "en_US.UTF8"
+      }
+    }
+
+    users = {
+      app_user = {
+        password_secret = "csql-postgres-app-user-password"
+        type            = "BUILT_IN"
+      }
+    }
+
+    flags = {
+      "cloudsql.enable_pgaudit" = "on"
+      "pgaudit.log"            = "read,write,ddl"
+    }
+
+    labels = {
+      environment = "development"
+      team        = "dba"
+    }
+  }
+
+  sqlserver01 = {
+    database_version  = "SQLSERVER_2022_ENTERPRISE"
+    tier              = "db-custom-4-16384"
+    availability_type = "REGIONAL"
+
+    root_password_secret = "csql-sqlserver-root-password"
+
+    psc_config = {
+      allowed_consumer_projects = ["154211679085"]
+    }
+
+    databases = {
+      sqldb01 = {
+        name = "sqldb01"
+      }
+    }
+
+    users = {
+      sql_app_user = {
+        password_secret = "csql-sqlserver-app-user-password"
+      }
+    }
+
+    labels = {
+      environment = "development"
+      team        = "dba"
+    }
+  }
+}
+
+Important: for SQL Server, do not use charset or collation in the google_sql_database resource. That was the root cause of your earlier database creation failure.
